@@ -154,45 +154,59 @@ app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 app.post('/api/ark/create-payment-link', async (req, res) => {
   try {
     const { displayMinutes, totalPrice, subtotal } = req.body || {};
-    const amountCents = Math.round(Number(subtotal) * 100);
-    if (!Number.isFinite(amountCents) || amountCents <= 0) {
-      return res.status(200).json({ error: 'INVALID_SUBTOTAL' });
-    }
+    const ref = crypto.randomUUID();
+    const bookingBase = process.env.BOOKING_URL ?? 'https://www.arkfurniture.ca/pages/book-touchup';
 
-    const client = sq();
-    const ref = randomUUID();
-
-    const body = {
-      idempotencyKey: randomUUID(),
+    const createReq = {
+      idempotencyKey: crypto.randomUUID(),
+      quickPay: {
+        name: `In-home touch-up (${displayMinutes} min)`,
+        priceMoney: { amount: Math.round(totalPrice * 100), currency: 'CAD' },
+        locationId: process.env.SQUARE_LOCATION_ID,
+      },
       order: {
-        locationId: process.env.SQUARE_LOCATION_ID, // optional for multi-location sellers; still good to set yours
-        referenceId: ref,
-        lineItems: [{
-          name: 'In-home Touch-Up Visit',
-          quantity: '1',
-          basePriceMoney: { amount: amountCents, currency: CURRENCY }
-        }]
+        locationId: process.env.SQUARE_LOCATION_ID,
+        referenceId: ref,                     // keep storing your ref on the order
+        lineItems: [
+          {
+            name: `In-home touch-up`,
+            quantity: '1',
+            basePriceMoney: { amount: Math.round(subtotal * 100), currency: 'CAD' }
+          }
+        ]
       },
       checkoutOptions: {
-        redirectUrl:
-          `${SITE}/pages/book-touchup?ref=${encodeURIComponent(ref)}` +
-          `&minutes=${encodeURIComponent(displayMinutes || 60)}` +
-          `&price=${encodeURIComponent(totalPrice || subtotal)}` +
-          `&currency=${encodeURIComponent(CURRENCY)}`
+        // temp value; we’ll overwrite below once we have orderId
+        redirectUrl: bookingBase
       }
     };
 
-    const { result } = await client.checkoutApi.createPaymentLink(body);
+    const client = squareClient();
+    const { result } = await client.paymentLinksApi.createPaymentLink(createReq);
+
     const link = result.paymentLink;
+    const orderId = link.orderId;               // <<— Square returns it here
 
-    sessions.set(ref, {
-      orderId: link?.orderId || null,
-      linkId: link?.id || null,
-      at: Date.now()
-    });
+    // Build the final redirect URL (now with orderId)
+    const redirect = new URL(bookingBase);
+    redirect.searchParams.set('ref', ref);
+    redirect.searchParams.set('orderId', orderId);
+    redirect.searchParams.set('minutes', String(displayMinutes || 60));
+    redirect.searchParams.set('price', String(totalPrice || subtotal || 0));
+    redirect.searchParams.set('currency', 'CAD');
 
-    console.log('create-link', { ref, orderId: link?.orderId, linkId: link?.id, site: SITE });
-    return res.status(200).json({ url: link.url, orderId: link.orderId, ref });
+    // Update the payment link to use the final redirect (optional but nice)
+    try {
+      await client.paymentLinksApi.updatePaymentLink(link.id, {
+        paymentLink: { checkoutOptions: { redirectUrl: redirect.toString() } }
+      });
+    } catch { /* not fatal */ }
+
+    // Keep a tiny in-memory note (survives until the VM restarts)
+    mem.orders ??= new Map();
+    mem.orders.set(ref, { orderId, createdAt: Date.now() });
+
+    res.json({ url: link.url, orderId, ref });
   } catch (e) {
     return sendErr(res, 'CREATE_LINK_FAILED', e);
   }
@@ -203,67 +217,69 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
  */
 app.get('/api/ark/verify', async (req, res) => {
   try {
-    const { ref, orderId } = req.query;
-    if (!ref && !orderId) return res.status(200).json({ ok: false, error: 'MISSING_REF_OR_ORDERID' });
+    const { ref = '', orderId = '' } = req.query;
+    if (!ref && !orderId) {
+      return res.status(400).json({ ok: false, error: 'MISSING_REF_OR_ORDER_ID' });
+    }
 
-    const client = sq();
+    const client = squareClient(); // your existing helper
+    const locId  = process.env.SQUARE_LOCATION_ID;
 
-    // 1) prefer supplied/cached orderId
-    let oid = orderId || sessions.get(ref)?.orderId;
+    // 1) If we have an orderId, use it directly.
+    let order = null;
+    if (orderId) {
+      const { result } = await client.ordersApi.retrieveOrder(orderId);
+      order = result.order || null;
+    }
 
-    // 2) recover via stored paymentLink
-    if (!oid && sessions.get(ref)?.linkId) {
-      try {
-        const { result } = await client.checkoutApi.getPaymentLink(sessions.get(ref).linkId);
-        oid = result?.paymentLink?.orderId || oid;
-        if (oid) sessions.set(ref, { ...sessions.get(ref), orderId: oid });
-      } catch (e) {
-        return sendErr(res, 'VERIFY_EXCEPTION', e);
+    // 2) If no order yet and you cached it on creation, try memory:
+    if (!order && ref && mem.orders?.has(ref)) {
+      const cached = mem.orders.get(ref); // you can store orderId when creating the link
+      if (cached?.orderId) {
+        const { result } = await client.ordersApi.retrieveOrder(cached.orderId);
+        order = result.order || null;
       }
     }
 
-    // 3) last resort: search orders by referenceId across ALL locations
-    if (!oid) {
-      const locs = await listAllLocations(client);
-      const since = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(); // last 24h
-      const matches = await searchOrdersByRef(client, ref, since, locs);
-      if (matches.length) oid = matches[0].id;
+    if (!order) {
+      return res.status(200).json({ ok: false, error: 'ORDER_NOT_FOUND', ref, orderId });
     }
 
-    if (!oid) return res.status(200).json({ ok: false, error: 'Order not found', ref });
-
-    // 4) retrieve order
-    const { result: ro } = await client.ordersApi.retrieveOrder(oid);
-    const order = ro.order;
-    const state = order?.state; // DRAFT | OPEN | COMPLETED | CANCELED
-    const matchesRef = (order?.referenceId || order?.reference_id) === ref;
-
-    // 5) if order is completed -> OK
-    if (state === 'COMPLETED') {
-      return res.status(200).json({ ok: true, orderId: oid, state, matchesRef });
+    // Safety check: same location and your referenceId if you set it
+    if (order.locationId && locId && order.locationId !== locId) {
+      return res.status(200).json({ ok: false, error: 'LOCATION_MISMATCH', orderLocation: order.locationId, expected: locId });
     }
 
-    // 6) payments fallback (tender.id == payment.id); accept COMPLETED payment even if order still OPEN
-    const sincePay = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString(); // last 24h
-    const pays = await listRecentPayments(client, sincePay);
-    const pay = pays.find(p => p.orderId === oid && p.status === 'COMPLETED');
-
-    if (pay) {
-      return res.status(200).json({
-        ok: true,
-        orderId: oid,
-        state, // may still be OPEN briefly
-        paymentStatus: pay.status,
-        paymentId: pay.id,
-        matchesRef
-      });
+    // 3) If order is already COMPLETED we're good
+    if (order.state === 'COMPLETED') {
+      return res.json({ ok: true, state: 'COMPLETED', orderId: order.id });
     }
 
-    // not paid yet
-    return res.status(200).json({ ok: false, orderId: oid, state, matchesRef });
+    // 4) Order isn’t completed yet — see if a payment already completed
+    const t = (order.tenders || [])[0];
+    if (t?.paymentId) {
+      const { result: payRes } = await client.paymentsApi.getPayment(t.paymentId);
+      const payment = payRes.payment;
+      if (payment?.status === 'COMPLETED') {
+        return res.json({
+          ok: true,
+          state: order.state,            // likely OPEN for a moment
+          paymentStatus: 'COMPLETED',
+          orderId: order.id,
+          paymentId: payment.id
+        });
+      }
+    }
+
+    // 5) Not completed yet
+    return res.json({
+      ok: false,
+      error: 'NOT_COMPLETED_YET',
+      state: order.state,
+      orderId: order.id
+    });
   } catch (e) {
-    console.error('verify error', e);
-    return res.status(200).json({ ok: false, error: 'VERIFY_EXCEPTION' });
+    return sendErr(res, 'VERIFY_EXCEPTION', e); // your verbose helper
   }
 });
 
