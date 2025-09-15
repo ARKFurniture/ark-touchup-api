@@ -6,13 +6,6 @@
  *   GET  /api/ark/debug?ref=...
  *   GET  /api/ark/info
  *   GET  /healthz
- *
- * Env (Fly secrets):
- *   SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID, SQUARE_ENV ("sandbox"|"production")
- *   SITE_BASE_URL (e.g. https://www.arkfurniture.ca)
- *   CURRENCY (e.g. CAD)
- *   ALLOWED_ORIGINS (comma-separated origins for CORS)
- *   DEBUG_VERBOSE=1 (optional; returns error details in JSON)
  */
 
 const express = require('express');
@@ -41,7 +34,7 @@ function squareClient() {
       (process.env.SQUARE_ENV || 'sandbox').toLowerCase() === 'production'
         ? Environment.Production
         : Environment.Sandbox,
-    userAgentDetail: 'ark-touchup-api/3.0',
+    userAgentDetail: 'ark-touchup-api/3.1',
   });
 }
 
@@ -52,6 +45,10 @@ const sessions = new Map();
 const PORT = process.env.PORT || 3000;
 const CURRENCY = process.env.CURRENCY || 'CAD';
 const SITE = process.env.SITE_BASE_URL || 'https://www.arkfurniture.ca';
+
+// NEW: server-side minimums (override via Fly secrets)
+const MIN_PRICE = Number(process.env.MIN_PRICE || '120');     // dollars
+const MIN_MINUTES = Number(process.env.MIN_MINUTES || '60');  // minutes
 
 // CORS allowlist
 const ALLOWED = new Set([
@@ -118,6 +115,8 @@ async function searchOrdersByRef(client, ref, sinceISO, locationIds /* optional 
   return matches;
 }
 
+const round2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+
 // ---------- Routes ----------
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
@@ -129,19 +128,29 @@ app.get('/api/ark/info', (req, res) => {
     locationId: process.env.SQUARE_LOCATION_ID || null,
     site: SITE,
     currency: CURRENCY,
+    minPrice: MIN_PRICE,
+    minMinutes: MIN_MINUTES,
   });
 });
 
 /**
  * Create Payment Link
- * - Uses ORDER (not quickPay) so we always get an orderId
- * - Sets order.referenceId = ref (so /verify can search by ref)
- * - After creating, updates redirectUrl to include orderId in query
+ * - Enforces server-side MIN_PRICE and MIN_MINUTES
+ * - Sets order.referenceId = ref
+ * - Redirect includes the *effective* (min-applied) price
  */
 app.post('/api/ark/create-payment-link', async (req, res) => {
   try {
-    const { displayMinutes = 60, totalPrice, subtotal } = req.body || {};
-    const amountCents = Math.round(Number(subtotal ?? totalPrice ?? 0) * 100);
+    let { displayMinutes = 60, totalPrice, subtotal } = req.body || {};
+
+    // Clamp minutes on server
+    const minutes = Math.max(MIN_MINUTES, Number(displayMinutes || 0) || MIN_MINUTES);
+
+    // Compute effective price with server-side minimum
+    const rawPrice = Number(subtotal ?? totalPrice ?? 0) || 0;
+    const charge = Math.max(MIN_PRICE, round2(rawPrice)); // dollars
+    const amountCents = Math.round(charge * 100);
+
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(200).json({ ok: false, error: 'INVALID_AMOUNT' });
     }
@@ -149,16 +158,15 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
     const ref = randomUUID();
     const bookingBase = process.env.BOOKING_URL || `${SITE}/pages/book-touchup`;
 
-    // Build the final redirect URL NOW (so Square will always use it)
+    // Redirect built *before* API call, includes effective price
     const redirect = new URL(bookingBase);
     redirect.searchParams.set('ref', ref);
-    redirect.searchParams.set('minutes', String(displayMinutes));
-    redirect.searchParams.set('price', String(Number(totalPrice ?? subtotal ?? 0)));
+    redirect.searchParams.set('minutes', String(minutes));
+    redirect.searchParams.set('price', String(charge));
     redirect.searchParams.set('currency', CURRENCY);
 
     const client = squareClient();
 
-    // Create link with an ORDER (ensures we get orderId); redirect already final
     const createBody = {
       idempotencyKey: randomUUID(),
       order: {
@@ -172,31 +180,24 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
           },
         ],
       },
-      checkoutOptions: {
-        redirectUrl: redirect.toString(), // <- final redirect set up front
-      },
+      checkoutOptions: { redirectUrl: redirect.toString() },
     };
 
     const { result } = await client.checkoutApi.createPaymentLink(createBody);
     const link = result.paymentLink;
     const orderId = link?.orderId || null;
 
-    // cache ref → { orderId, linkId }
     sessions.set(ref, { orderId, linkId: link?.id || null, at: Date.now() });
 
-    console.log('create-link', { ref, orderId, linkId: link?.id });
-    return res.status(200).json({ url: link.url, orderId, ref });
+    console.log('create-link', { ref, orderId, linkId: link?.id, charge, minutes });
+    return res.status(200).json({ url: link.url, orderId, ref, charge, minutes });
   } catch (e) {
     return sendErr(res, 'CREATE_LINK_FAILED', e);
   }
 });
 
 /**
- * Verify payment by orderId or ref
- * - Prefer orderId (fastest & most reliable)
- * - Else recover via cached link/order
- * - Else search all locations for order.referenceId === ref
- * - Accept COMPLETED order OR COMPLETED payment on the order's tender
+ * Verify payment by orderId or ref (no listPayments call)
  */
 app.get('/api/ark/verify', async (req, res) => {
   try {
@@ -210,7 +211,6 @@ app.get('/api/ark/verify', async (req, res) => {
 
     let oid = orderId || sessions.get(ref)?.orderId || null;
 
-    // recover orderId via stored payment link id
     if (!oid && sessions.get(ref)?.linkId) {
       try {
         const { result } = await client.checkoutApi.getPaymentLink(sessions.get(ref).linkId);
@@ -221,7 +221,6 @@ app.get('/api/ark/verify', async (req, res) => {
       }
     }
 
-    // last resort: search by referenceId across all locations (last 24h)
     if (!oid && ref) {
       const locs = await listAllLocations(client);
       const since = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString();
@@ -229,16 +228,12 @@ app.get('/api/ark/verify', async (req, res) => {
       if (matches.length) oid = matches[0].id;
     }
 
-    if (!oid) {
-      return res.status(200).json({ ok: false, error: 'ORDER_NOT_FOUND', ref });
-    }
+    if (!oid) return res.status(200).json({ ok: false, error: 'ORDER_NOT_FOUND', ref });
 
-    // retrieve order
     const { result: ro } = await client.ordersApi.retrieveOrder(oid);
     const order = ro.order;
-    const state = order?.state; // DRAFT | OPEN | COMPLETED | CANCELED
+    const state = order?.state;
 
-    // optional safety: location check
     if (order?.locationId && expectedLoc && order.locationId !== expectedLoc) {
       return res.status(200).json({
         ok: false,
@@ -253,7 +248,6 @@ app.get('/api/ark/verify', async (req, res) => {
       return res.status(200).json({ ok: true, state, orderId: oid, matchesRef: (order.referenceId || order.reference_id) === ref });
     }
 
-    // payments fallback via tender → getPayment
     const tender = (order?.tenders || [])[0];
     if (tender?.paymentId) {
       const { result: rp } = await client.paymentsApi.getPayment(tender.paymentId);
@@ -261,7 +255,7 @@ app.get('/api/ark/verify', async (req, res) => {
       if (payment?.status === 'COMPLETED') {
         return res.status(200).json({
           ok: true,
-          state, // likely OPEN while order closes out
+          state,
           paymentStatus: 'COMPLETED',
           orderId: oid,
           paymentId: payment.id,
@@ -270,7 +264,6 @@ app.get('/api/ark/verify', async (req, res) => {
       }
     }
 
-    // not completed yet
     return res.status(200).json({
       ok: false,
       error: 'NOT_COMPLETED_YET',
@@ -285,7 +278,6 @@ app.get('/api/ark/verify', async (req, res) => {
 
 /**
  * Debug snapshot for a given ref
- * - Shows locations, cache, matching orders, and any payments linked via tenders
  */
 app.get('/api/ark/debug', async (req, res) => {
   try {
@@ -295,10 +287,8 @@ app.get('/api/ark/debug', async (req, res) => {
     const client = squareClient();
     const locs = await listAllLocations(client);
     const since = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString();
-
     const orders = await searchOrdersByRef(client, ref, since, locs);
 
-    // look up payments via each order's tender IDs
     const payments = [];
     for (const o of orders) {
       const t = (o.tenders || [])[0];
