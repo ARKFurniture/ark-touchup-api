@@ -1,123 +1,203 @@
-// ARK Touch-Up API (Pay → then Book)
+/**
+ * ARK Touch-Up API (server.js)
+ * - POST /api/ark/create-payment-link
+ * - GET  /api/ark/verify
+ * - GET  /healthz
+ *
+ * ENV (Fly secrets):
+ *   SQUARE_ACCESS_TOKEN=xxxx
+ *   SQUARE_LOCATION_ID=xxxx
+ *   SQUARE_ENV=sandbox|production
+ *   SITE_BASE_URL=https://www.arkfurniture.ca
+ *   CURRENCY=CAD
+ *   ALLOWED_ORIGINS=https://www.arkfurniture.ca,https://arkfurniture.ca,https://arkfurniture.myshopify.com
+ */
+
 const express = require('express');
-const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const { Client, Environment } = require('square');
-require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
-// --- CORS: allow your Shopify domains to call this API from the browser
-const ALLOWED = [
-  'https://arkfurniture.ca',
-  'https://www.arkfurniture.ca',
-  'https://ark-furniture-toronto.myshopify.com'
-  
-].filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    cb(null, ALLOWED.includes(origin));
-  }
-}));
+// ---------- Config & Helpers ----------
+const PORT = process.env.PORT || 3000;
+const CURRENCY = process.env.CURRENCY || 'CAD';
+const SITE_BASE_URL = process.env.SITE_BASE_URL || 'https://www.arkfurniture.ca';
+const SQUARE_ENV = (process.env.SQUARE_ENV || 'sandbox').toLowerCase() === 'production'
+  ? Environment.Production
+  : Environment.Sandbox;
 
-// --- Square client
-const square = new Client({
-  accessToken: process.env.SQUARE_ACCESS_TOKEN,
-  environment: process.env.SQUARE_ENV === 'production' ? Environment.Production : Environment.Sandbox
+const REQUIRED_ENVS = ['SQUARE_ACCESS_TOKEN', 'SQUARE_LOCATION_ID'];
+for (const key of REQUIRED_ENVS) {
+  if (!process.env[key]) {
+    console.warn(`[WARN] Missing env ${key}. Set it with: flyctl secrets set ${key}=VALUE -a ark-touchup-api`);
+  }
+}
+
+const defaultAllowed = new Set([
+  'https://www.arkfurniture.ca',
+  'https://arkfurniture.ca',
+  'https://arkfurniture.myshopify.com'
+]);
+if (process.env.ALLOWED_ORIGINS) {
+  process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean).forEach(o => defaultAllowed.add(o));
+}
+
+// Tiny in-memory ref→orderId cache (OK for testing; use Redis for HA)
+const sessions = new Map();
+
+// Manual CORS (no extra deps)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && defaultAllowed.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
 });
 
-const PORT        = process.env.PORT || 3000;
-const LOCATION_ID = process.env.SQUARE_LOCATION_ID;
-const SITE_BASE   = (process.env.SITE_BASE_URL || 'https://arkfurniture.ca').replace(/\/$/, ''); // no trailing slash
-const CURRENCY    = process.env.CURRENCY || 'CAD';
+function squareClient() {
+  return new Client({
+    accessToken: process.env.SQUARE_ACCESS_TOKEN,
+    environment: SQUARE_ENV,
+    userAgentDetail: 'ark-touchup-api/1.0' // shows up in Square logs
+  });
+}
 
-const toCents = n => Math.round(Number(n) * 100);
+// ---------- Routes ----------
+app.get('/healthz', (req, res) => res.status(200).send('ok'));
 
-// Health check for Fly
-app.get('/healthz', (_, res) => res.status(200).send('ok'));
-
-// Create a Square-hosted payment link for exact total
+/**
+ * Create a Square Payment Link and return { url, orderId?, ref }.
+ * Body JSON:
+ *  {
+ *    "displayMinutes": 150,
+ *    "totalPrice": 300,
+ *    "subtotal": 300
+ *  }
+ */
 app.post('/api/ark/create-payment-link', async (req, res) => {
   try {
-    const {
-      displayMinutes = 60,
-      totalPrice,           // required (your calculator’s final price)
-      subtotal,             // optional (for logging/metrics)
-      breakdown = {},       // optional
-      currency = CURRENCY
-    } = req.body || {};
-
-    if (!LOCATION_ID) return res.status(500).json({ error: 'Missing SQUARE_LOCATION_ID' });
-    if (!process.env.SQUARE_ACCESS_TOKEN) return res.status(500).json({ error: 'Missing SQUARE_ACCESS_TOKEN' });
-    if (!totalPrice || Number(totalPrice) <= 0) {
-      return res.status(400).json({ error: 'Missing/invalid totalPrice' });
+    const { displayMinutes, totalPrice, subtotal } = req.body || {};
+    if (!subtotal || isNaN(Number(subtotal))) {
+      return res.status(200).json({ error: 'INVALID_SUBTOTAL' });
     }
 
-    const ref = uuidv4(); // our cross-check token
-    const { result } = await square.checkoutApi.createPaymentLink({
-      idempotencyKey: uuidv4(),
+    const locationId = process.env.SQUARE_LOCATION_ID;
+    const currency = CURRENCY;
+    const client = squareClient();
+
+    const ref = randomUUID(); // we will carry this through to redirect & verification
+    const amountCents = Math.round(Number(subtotal) * 100);
+
+    // IMPORTANT: use "order" (not quickPay) so we can set referenceId
+    const body = {
+      idempotencyKey: randomUUID(),
       order: {
-        locationId: LOCATION_ID,
+        locationId,
         referenceId: ref,
         lineItems: [
           {
-            name: `Touch‑Up visit (${displayMinutes} min)`,
+            name: 'In-home Touch-Up Visit',
             quantity: '1',
-            basePriceMoney: { amount: toCents(totalPrice), currency }
+            basePriceMoney: { amount: amountCents, currency }
           }
         ]
       },
       checkoutOptions: {
-        redirectUrl: `${SITE_BASE}/pages/book-touchup?ref=${encodeURIComponent(ref)}&minutes=${encodeURIComponent(displayMinutes)}&price=${encodeURIComponent(totalPrice)}&currency=${encodeURIComponent(currency)}`
+        redirectUrl:
+          `${SITE_BASE_URL}/pages/book-touchup` +
+          `?ref=${encodeURIComponent(ref)}` +
+          `&minutes=${encodeURIComponent(displayMinutes || 60)}` +
+          `&price=${encodeURIComponent(totalPrice || subtotal)}` +
+          `&currency=${encodeURIComponent(currency)}`
       }
-    });
+    };
 
-    const link = result?.paymentLink;
-    if (!link?.url && !link?.longUrl) return res.status(500).json({ error: 'No payment link returned' });
+    const { result } = await client.checkoutApi.createPaymentLink(body);
+    const paymentLink = result.paymentLink;
 
-    return res.json({
-      url: link.url || link.longUrl,
-      orderId: link.orderId,
+    if (paymentLink?.orderId) {
+      sessions.set(ref, { orderId: paymentLink.orderId, at: Date.now() });
+    }
+
+    return res.status(200).json({
+      url: paymentLink.url,
+      orderId: paymentLink.orderId, // may be undefined on redirect in Sandbox, but useful here
       ref
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Square createPaymentLink failed', detail: err?.message });
+    console.error('create-payment-link error:', err);
+    return res.status(200).json({ error: 'CREATE_LINK_FAILED' });
   }
 });
 
-// Verify payment completed before showing scheduler
+/**
+ * Verify a payment by orderId OR ref.
+ * Query:
+ *   /api/ark/verify?ref=UUID[&orderId=xxxx]
+ * Returns { ok, state, orderId, matchesRef }
+ */
 app.get('/api/ark/verify', async (req, res) => {
   try {
-    const { orderId, ref } = req.query || {};
-    if (!orderId && !ref) return res.status(400).json({ ok: false, error: 'Missing orderId or ref' });
-
-    let order;
-    if (orderId) {
-      const { result } = await square.ordersApi.retrieveOrder(orderId);
-      order = result?.order;
-    } else {
-      // Fallback: search recent completed orders by referenceId
-      const { result } = await square.ordersApi.searchOrders({
-        locationIds: [LOCATION_ID],
-        query: { filter: { stateFilter: { states: ['COMPLETED'] } } },
-        returnEntries: false,
-        limit: 50
-      });
-      order = (result?.orders || []).find(o => o.referenceId === ref);
+    const { ref, orderId } = req.query;
+    if (!ref && !orderId) {
+      return res.status(200).json({ ok: false, error: 'MISSING_REF_OR_ORDERID' });
     }
 
-    if (!order) return res.status(404).json({ ok: false, error: 'Order not found' });
-    const paid = order.state === 'COMPLETED';
-    const matchesRef = ref ? (order.referenceId === ref) : true;
+    const client = squareClient();
+    const locationId = process.env.SQUARE_LOCATION_ID;
 
-    return res.json({ ok: paid && matchesRef, orderId: order.id, state: order.state, matchesRef });
+    // 1) Prefer supplied orderId or cached orderId from session
+    let oid = orderId || sessions.get(ref)?.orderId;
+
+    // 2) Sandbox fallback: find by referenceId among recent orders
+    if (!oid) {
+      const since = new Date(Date.now() - 1000 * 60 * 180).toISOString(); // last 3 hours
+      const searchBody = {
+        locationIds: [locationId],
+        query: {
+          sort: { sortField: 'CREATED_AT', sortOrder: 'DESC' },
+          filter: {
+            dateTimeFilter: { createdAt: { startAt: since } },
+            stateFilter: { states: ['OPEN', 'COMPLETED', 'CANCELED', 'DRAFT'] }
+          }
+        },
+        returnEntries: false
+      };
+      const { result } = await client.ordersApi.searchOrders(searchBody);
+      const orders = result.orders || [];
+      const match = orders.find(o => (o.referenceId || o.reference_id) === ref);
+      if (match) oid = match.id;
+    }
+
+    if (!oid) {
+      return res.status(200).json({ ok: false, error: 'ORDER_NOT_FOUND_FOR_REF', ref });
+    }
+
+    // 3) Retrieve order and require COMPLETED (paid)
+    const { result: ro } = await client.ordersApi.retrieveOrder(oid);
+    const order = ro.order;
+    const state = order?.state; // DRAFT | OPEN | COMPLETED | CANCELED
+    const paid = state === 'COMPLETED';
+
+    return res.status(200).json({
+      ok: paid,
+      orderId: oid,
+      state,
+      matchesRef: (order?.referenceId || order?.reference_id) === ref
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: 'Verify failed', detail: err?.message });
+    console.error('verify error:', err);
+    return res.status(200).json({ ok: false, error: 'VERIFY_EXCEPTION' });
   }
 });
 
-app.listen(PORT, () => console.log(`ARK API listening on :${PORT}`));
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log(`[ark-touchup-api] listening on ${PORT}`);
+});
