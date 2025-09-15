@@ -140,67 +140,82 @@ app.get('/api/ark/verify', async (req, res) => {
 
     const client = squareClient();
 
-    // 1) direct or cached orderId
+    // 1) start with orderId from query or session
     let oid = orderId || sessions.get(ref)?.orderId;
 
-    // 2) try to recover orderId from the stored paymentLink id
+    // 2) fallback: recover orderId from payment link (if cached)
     if (!oid && sessions.get(ref)?.linkId) {
       try {
         const { result } = await client.checkoutApi.getPaymentLink(sessions.get(ref).linkId);
         oid = result?.paymentLink?.orderId || oid;
         if (oid) sessions.set(ref, { ...sessions.get(ref), orderId: oid });
-      } catch (e) {
-        console.warn('getPaymentLink failed for ref', ref, e?.message || e);
-      }
+      } catch {}
     }
 
-    // 3) last resort: search all locations and match referenceId
+    // 3) last resort: search orders by referenceId across recent window
     if (!oid) {
-      // list locations once, cache in memory to reduce calls
-      if (!sessions.get('__locations__')) {
-        const { result } = await client.locationsApi.listLocations();
-        sessions.set('__locations__', result.locations?.map(l => l.id) || []);
-      }
-      const locations = sessions.get('__locations__');
-      const since = new Date(Date.now() - 1000 * 60 * 24 * 60).toISOString(); // last 24h
-
-      // search each location (stop on first match)
-      for (const locId of locations) {
-        const { result } = await client.ordersApi.searchOrders({
-          locationIds: [locId],
-          query: {
-            sort: { sortField: 'CREATED_AT', sortOrder: 'DESC' },
-            filter: {
-              dateTimeFilter: { createdAt: { startAt: since } },
-              stateFilter: { states: ['OPEN','COMPLETED','CANCELED','DRAFT'] }
-            }
+      const since = new Date(Date.now() - 1000 * 60 * 180).toISOString(); // last 3h
+      const { result } = await client.ordersApi.searchOrders({
+        query: {
+          sort: { sortField: 'CREATED_AT', sortOrder: 'DESC' },
+          filter: {
+            dateTimeFilter: { createdAt: { startAt: since } },
+            stateFilter: { states: ['OPEN','COMPLETED','CANCELED','DRAFT'] }
           }
-        });
-        const orders = result.orders || [];
-        const match = orders.find(o => (o.referenceId || o.reference_id) === ref);
-        if (match) { oid = match.id; break; }
-      }
+        }
+      });
+      const orders = result.orders || [];
+      const match = orders.find(o => (o.referenceId || o.reference_id) === ref);
+      if (match) oid = match.id;
     }
 
     if (!oid) return res.status(200).json({ ok: false, error: 'Order not found', ref });
 
-    // retrieve and require COMPLETED
+    // 4) retrieve order
     const { result: ro } = await client.ordersApi.retrieveOrder(oid);
     const order = ro.order;
     const state = order?.state; // DRAFT | OPEN | COMPLETED | CANCELED
-    const ok = state === 'COMPLETED';
+    const matchesRef = (order?.referenceId || order?.reference_id) === ref;
 
-    // small nicety: store back the orderId if we learned it
-    if (!sessions.get(ref)?.orderId) sessions.set(ref, { ...sessions.get(ref), orderId: oid });
+    // 5) happy path: order completed
+    if (state === 'COMPLETED') {
+      return res.status(200).json({ ok: true, orderId: oid, state, matchesRef });
+    }
 
-    return res.status(200).json({
-      ok,
-      orderId: oid,
-      state,
-      matchesRef: (order?.referenceId || order?.reference_id) === ref
-    });
+    // 6) fallback: check Payments API for a COMPLETED payment on this order
+    // (Square says tender.id == payment.id; Payments also includes orderId)
+    const sincePay = new Date(Date.now() - 1000 * 60 * 180).toISOString(); // last 3h
+    const payments = [];
+    let cursor;
+    do {
+      const { result } = await client.paymentsApi.listPayments({
+        beginTime: sincePay,
+        sortOrder: 'DESC',
+        cursor
+      });
+      payments.push(...(result.payments || []));
+      cursor = result.cursor;
+    } while (cursor);
+
+    const pay = payments.find(p => p.orderId === oid && p.status === 'COMPLETED');
+
+    if (pay) {
+      // If payment is completed, consider verification OK even if order still OPEN
+      return res.status(200).json({
+        ok: true,
+        orderId: oid,
+        state,                // likely OPEN for a short time
+        paymentStatus: pay.status,
+        paymentId: pay.id,
+        matchesRef
+      });
+    }
+
+    // Not completed yet
+    return res.status(200).json({ ok: false, orderId: oid, state, matchesRef });
+
   } catch (e) {
-    console.error('verify error', e);
+    console.error('verify error:', e);
     return res.status(200).json({ ok: false, error: 'VERIFY_EXCEPTION' });
   }
 });
