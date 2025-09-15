@@ -20,6 +20,19 @@ const { randomUUID } = require('crypto');
 const { Client, Environment } = require('square');
 
 const app = express();
+
+// Toggle detailed errors by setting DEBUG_VERBOSE=1 in Fly secrets
+function sendErr(res, tag, err) {
+  console.error(`[${tag}]`, err && err.stack ? err.stack : err);
+  const verbose = process.env.DEBUG_VERBOSE === '1';
+  const payload = { ok: false, error: tag };
+  if (verbose) {
+    payload.message = err?.message || String(err);
+    if (err?.errors) payload.square = err.errors; // Square SDK error array
+  }
+  return res.status(200).json(payload);
+}
+
 app.use(express.json());
 
 // ---------- Config ----------
@@ -175,8 +188,7 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
     console.log('create-link', { ref, orderId: link?.orderId, linkId: link?.id, site: SITE });
     return res.status(200).json({ url: link.url, orderId: link.orderId, ref });
   } catch (e) {
-    console.error('create-payment-link error', e);
-    return res.status(200).json({ error: 'CREATE_LINK_FAILED' });
+    return sendErr(res, 'CREATE_LINK_FAILED', e);
   }
 });
 
@@ -200,7 +212,7 @@ app.get('/api/ark/verify', async (req, res) => {
         oid = result?.paymentLink?.orderId || oid;
         if (oid) sessions.set(ref, { ...sessions.get(ref), orderId: oid });
       } catch (e) {
-        console.warn('getPaymentLink failed', e?.message || e);
+        return sendErr(res, 'VERIFY_EXCEPTION', e);
       }
     }
 
@@ -284,8 +296,7 @@ app.get('/api/ark/debug', async (req, res) => {
     };
     return res.status(200).json(snapshot);
   } catch (e) {
-    console.error('debug error', e);
-    return res.status(200).json({ error: 'DEBUG_EXCEPTION' });
+    return sendErr(res, 'DEBUG_EXCEPTION', e);
   }
 });
 
