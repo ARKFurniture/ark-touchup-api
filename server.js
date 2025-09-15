@@ -132,7 +132,13 @@ async function listRecentPayments(client, sinceISO) {
   const payments = [];
   let cursor;
   do {
-    const { result } = await client.paymentsApi.listPayments({ beginTime: sinceISO, sortOrder: 'DESC', cursor });
+    const { result } = await client.paymentsApi.listPayments(
+      sinceISO,          // beginTime (ISO string)
+      undefined,         // endTime
+      'DESC',            // sortOrder
+      cursor             // cursor (for pagination)
+      // you can optionally pass locationId as the 5th arg if you want to filter
+    );
     payments.push(...(result.payments || []));
     cursor = result.cursor;
   } while (cursor);
