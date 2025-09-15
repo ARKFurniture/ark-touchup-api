@@ -154,11 +154,11 @@ app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 app.post('/api/ark/create-payment-link', async (req, res) => {
   try {
     const { displayMinutes, totalPrice, subtotal } = req.body || {};
-    const ref = crypto.randomUUID();
+    const ref = randomUUID();
     const bookingBase = process.env.BOOKING_URL ?? 'https://www.arkfurniture.ca/pages/book-touchup';
 
     const createReq = {
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: randomUUID(),
       quickPay: {
         name: `In-home touch-up (${displayMinutes} min)`,
         priceMoney: { amount: Math.round(totalPrice * 100), currency: 'CAD' },
