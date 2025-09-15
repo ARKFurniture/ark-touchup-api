@@ -12,7 +12,8 @@ app.use(express.json());
 const ALLOWED = [
   'https://arkfurniture.ca',
   'https://www.arkfurniture.ca',
-  'https://arkfurniture.myshopify.com'
+  'https://ark-furniture-toronto.myshopify.com'
+  
 ].filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
