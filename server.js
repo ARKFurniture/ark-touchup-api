@@ -291,5 +291,6 @@ app.get('/api/ark/debug', async (req, res) => {
 
 // ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`[ark-touchup-api] listening on ${PORT}`);
+  console.log(`[ark-touchup-api DEBUG] listening on ${PORT} at ${new Date().toISOString()}`);
 });
+
