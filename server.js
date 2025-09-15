@@ -149,9 +149,16 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
     const ref = randomUUID();
     const bookingBase = process.env.BOOKING_URL || `${SITE}/pages/book-touchup`;
 
+    // Build the final redirect URL NOW (so Square will always use it)
+    const redirect = new URL(bookingBase);
+    redirect.searchParams.set('ref', ref);
+    redirect.searchParams.set('minutes', String(displayMinutes));
+    redirect.searchParams.set('price', String(Number(totalPrice ?? subtotal ?? 0)));
+    redirect.searchParams.set('currency', CURRENCY);
+
     const client = squareClient();
 
-    // 1) Create link with ORDER + initial redirect (we'll update after we learn orderId)
+    // Create link with an ORDER (ensures we get orderId); redirect already final
     const createBody = {
       idempotencyKey: randomUUID(),
       order: {
@@ -166,7 +173,7 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
         ],
       },
       checkoutOptions: {
-        redirectUrl: bookingBase, // temporary; we update below
+        redirectUrl: redirect.toString(), // <- final redirect set up front
       },
     };
 
@@ -174,27 +181,8 @@ app.post('/api/ark/create-payment-link', async (req, res) => {
     const link = result.paymentLink;
     const orderId = link?.orderId || null;
 
-    // cache ref → {orderId, linkId}
+    // cache ref → { orderId, linkId }
     sessions.set(ref, { orderId, linkId: link?.id || null, at: Date.now() });
-
-    // 2) Build final redirect including orderId + other params
-    const redirect = new URL(bookingBase);
-    redirect.searchParams.set('ref', ref);
-    if (orderId) redirect.searchParams.set('orderId', orderId);
-    redirect.searchParams.set('minutes', String(displayMinutes));
-    redirect.searchParams.set('price', String(Number(totalPrice ?? subtotal ?? 0)));
-    redirect.searchParams.set('currency', CURRENCY);
-
-    // 3) Update the link to use the final redirect (best-effort)
-    try {
-      if (link?.id) {
-        await client.checkoutApi.updatePaymentLink(link.id, {
-          paymentLink: { checkoutOptions: { redirectUrl: redirect.toString() } },
-        });
-      }
-    } catch (e) {
-      console.warn('updatePaymentLink warning:', e?.message || e);
-    }
 
     console.log('create-link', { ref, orderId, linkId: link?.id });
     return res.status(200).json({ url: link.url, orderId, ref });
